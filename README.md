@@ -6,3 +6,4 @@ When this is deployed I'll leave some secret in the server it's deployed on. If 
 
 ## Resources
 [Beej's Guide to Sockets](https://beej.us/guide/bgnet/html/#client-server-background)
+[httpz.zig](https://github.com/karlseguin/http.zig/blob/master/src/url.zig)
