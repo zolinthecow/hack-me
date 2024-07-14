@@ -11,3 +11,7 @@ pub fn main() !void {
 
     try server.listen();
 }
+
+test {
+    std.testing.refAllDecls(@This());
+}

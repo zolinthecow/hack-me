@@ -3,6 +3,7 @@ const testing = std.testing;
 const posix = std.posix;
 
 const EventLoop = @import("event_loop.zig").EventLoop;
+const Request = @import("request.zig").Request;
 
 pub const Config = struct {
     port: ?u16 = null,
