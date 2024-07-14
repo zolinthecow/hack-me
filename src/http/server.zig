@@ -1,5 +1,8 @@
 const std: type = @import("std");
 const testing = std.testing;
+const posix = std.posix;
+
+const EventLoop = @import("event_loop.zig").EventLoop;
 
 pub const Config = struct {
     port: ?u16 = null,
@@ -8,10 +11,11 @@ pub const Config = struct {
 
 pub const Server = struct {
     config: Config,
+    _event_loop: EventLoop,
 
     const Self = @This();
 
-    pub fn init(config: Config) !Self {
+    pub fn init(allocator: std.mem.Allocator, config: Config) !Self {
         var server_config = config;
         if (config.port == null) {
             server_config.port = 8000;
@@ -20,10 +24,16 @@ pub const Server = struct {
             server_config.address = "127.0.0.1";
         }
 
-        return Server{ .config = server_config };
+        const evl = EventLoop.init(allocator);
+
+        return Server{ .config = server_config, ._event_loop = evl };
     }
 
-    pub fn listen(self: *Server) !void {
+    pub fn deinit(self: *Self) void {
+        self._event_loop.deinit();
+    }
+
+    pub fn listen(self: *Self) !void {
         // ---Bind to socket---
         const address = blk: {
             const listen_port = self.config.port.?;
@@ -32,28 +42,54 @@ pub const Server = struct {
         };
         std.debug.print("Starting server at {}..\n", .{address});
         // instantiate an IPv4 TCP socket
-        const sock = try std.posix.socket(address.any.family, std.posix.SOCK.STREAM, std.posix.IPPROTO.TCP);
-        defer std.posix.close(sock);
+        const sock = try posix.socket(address.any.family, posix.SOCK.STREAM, posix.IPPROTO.TCP);
+        defer posix.close(sock);
 
         // Allow reuse address
-        try std.posix.setsockopt(sock, std.posix.SOL.SOCKET, std.posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1)));
+        try posix.setsockopt(sock, posix.SOL.SOCKET, posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1)));
 
         {
             std.debug.print("Binding to socket..\n", .{});
-            try std.posix.bind(sock, &address.any, address.getOsSockLen());
-            try std.posix.listen(sock, 128);
+            try posix.bind(sock, &address.any, address.getOsSockLen());
+            try posix.listen(sock, 128);
         }
 
         std.debug.print("Waiting for connections..\n", .{});
-        while (true) {
-            const client_socket = try std.posix.accept(sock, null, null, 0);
-            defer std.posix.close(client_socket);
+        try self._event_loop.register_event(sock, .Read, self, Server.accept_callback);
+        try self._event_loop.run();
+    }
 
-            var buffer: [1024]u8 = undefined;
-            const received_bytes = try std.posix.recv(client_socket, &buffer, 0);
-            if (received_bytes > 0) {
-                std.debug.print("Received {d} bytes: {s}\n", .{ received_bytes, buffer[0..received_bytes] });
-            }
-        }
+    fn read_callback(self: *Self, sock: posix.fd_t) void {
+        var buffer: [1024]u8 = undefined;
+        const bytes_read = posix.read(sock, &buffer) catch |err| {
+            std.debug.print("Error reading: {}\n", .{err});
+            return;
+        };
+        std.debug.print("Read {} bytes: {s}\n", .{ bytes_read, buffer[0..bytes_read] });
+
+        const address = blk: {
+            const listen_port = self.config.port.?;
+            const listen_address = self.config.address.?;
+
+            break :blk std.net.Address.parseIp4(listen_address, listen_port) catch |err| {
+                std.debug.print("Error parsing address: {}\n", .{err});
+                // Provide a default address as fallback
+                break :blk std.net.Address.initIp4([4]u8{ 127, 0, 0, 1 }, 8000);
+            };
+        };
+        std.debug.print("temp {}\n", .{address});
+    }
+
+    fn accept_callback(self: *Self, sock: posix.fd_t) void {
+        const client_fd = posix.accept(sock, null, null, 0) catch |err| {
+            std.debug.print("Error accpeting connections: {}\n", .{err});
+            return;
+        };
+
+        std.debug.print("Accepted new connection\n", .{});
+        self._event_loop.register_event(client_fd, .Read, self, Server.read_callback) catch |err| {
+            std.debug.print("Error registering client: {}\n", .{err});
+            posix.close(client_fd);
+        };
     }
 };
