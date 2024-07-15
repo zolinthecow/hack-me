@@ -4,12 +4,34 @@
 const std = @import("std");
 
 pub const Url = struct {
-    raw: []const u8 = "",
-    path: []const u8 = "",
-    path_segments: []PathSegment = undefined,
-    query: []const u8 = "",
-    query_params: ?std.StringHashMap([]const u8),
-    fragment: []const u8 = "",
+    raw: []const u8,
+    path: []const u8,
+    path_segments: []const PathSegment,
+    query: []const u8,
+    query_params: std.StringHashMap([]const u8),
+    fragment: []const u8,
+    allocator: std.mem.Allocator,
+
+    pub fn deinit(self: *Url) void {
+        self.allocator.free(self.raw);
+        self.allocator.free(self.path);
+        self.allocator.free(self.query);
+        self.allocator.free(self.fragment);
+        var qp_it = self.query_params.iterator();
+        while (qp_it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            self.allocator.free(entry.value_ptr.*);
+        }
+        self.query_params.deinit();
+        for (self.path_segments) |seg| {
+            self.allocator.free(seg.name);
+            if (seg.params) |params| {
+                var params_to_free = params;
+                params_to_free.deinit();
+            }
+        }
+        self.allocator.free(self.path_segments);
+    }
 
     const UrlParts = enum { Path, Query, Fragment };
 
@@ -18,9 +40,9 @@ pub const Url = struct {
         params: ?std.StringHashMap([]const u8),
     };
 
-    pub fn parse(raw: []const u8) !Url {
-        var path: []const u8 = "";
-        var query: []const u8 = "";
+    pub fn parse(allocator: std.mem.Allocator, raw: []const u8) !Url {
+        var raw_path: []const u8 = raw;
+        var raw_query: []const u8 = "";
         var fragment: []const u8 = "";
 
         var part_processing: UrlParts = .Path;
@@ -31,15 +53,15 @@ pub const Url = struct {
                         if (i == 0) {
                             return error.InvalidUrl;
                         }
-                        path = raw[0..i];
-                        query = raw[i + 1 ..];
+                        raw_path = raw[0..i];
+                        raw_query = raw[i + 1 ..];
                         part_processing = .Query;
                         break;
                     }
                 },
                 .Query => {
                     if (char == '#') {
-                        query = query[0 .. i - path.len - 1];
+                        raw_query = raw_query[0 .. i - raw_path.len - 1];
                         fragment = raw[i + 1 ..];
                         part_processing = .Fragment;
                         break;
@@ -49,32 +71,57 @@ pub const Url = struct {
             }
         }
 
+        const unescaped_path_res = try unescape(allocator, raw_path, .Path);
+        var path_it = std.mem.splitSequence(u8, raw_path, "/");
+        var path_segments = std.ArrayList(PathSegment).init(allocator);
+        errdefer path_segments.deinit();
+        while (path_it.next()) |seg| {
+            if (std.mem.eql(u8, seg, "")) {
+                continue;
+            }
+            try path_segments.append(.{
+                .name = try unescape(allocator, seg, .Path),
+                // I'll implement this when I find a use case for them
+                .params = null,
+            });
+        }
+
+        const unescaped_query_res = try unescape(allocator, raw_query, .Query);
+        var query_params = std.StringHashMap([]const u8).init(allocator);
+        errdefer query_params.deinit();
+        var query_it = std.mem.split(u8, raw_query, "&");
+        while (query_it.next()) |seg| {
+            if (std.mem.eql(u8, seg, "")) {
+                continue;
+            }
+            var key: []const u8 = "";
+            var value: []const u8 = "";
+            if (std.mem.indexOfScalar(u8, seg, '=')) |idx| {
+                key = seg[0..idx];
+                if (idx + 1 < seg.len) {
+                    value = seg[idx + 1 ..];
+                }
+            } else {
+                key = seg;
+            }
+            try query_params.put(try unescape(allocator, key, .Query), try unescape(allocator, value, .Query));
+        }
+
+        const owned_path_segments = try path_segments.toOwnedSlice();
         return .{
-            .raw = raw,
-            .path = path,
-            .path_segments = undefined,
-            .query = query,
-            .query_params = undefined,
+            .raw = try allocator.dupe(u8, raw),
+            .path = unescaped_path_res,
+            .path_segments = owned_path_segments,
+            .query = unescaped_query_res,
+            .query_params = query_params,
             .fragment = fragment,
+            .allocator = allocator,
         };
     }
 
-    const UnescapedResult = struct {
-        value: []const u8,
-        allocator: ?std.mem.Allocator = null,
-
-        const Self = @This();
-
-        pub fn deinit(self: *Self) void {
-            if (self.allocator) |alloc| {
-                alloc.free(self.value);
-            }
-        }
-    };
-
     // As defined by RFC 3983 you URL encoded characters are now UTF-8 which means
     // they can now be multi-byte characters
-    fn unescape(allocator: std.mem.Allocator, input: []const u8, segment: UrlParts) !UnescapedResult {
+    fn unescape(allocator: std.mem.Allocator, input: []const u8, segment: UrlParts) ![]const u8 {
         var needs_modification = false;
 
         var i: usize = 0;
@@ -88,16 +135,17 @@ pub const Url = struct {
                 }
             } else if (input[i] == '+' and segment == .Query) {
                 needs_modification = true;
-                break;
+                i += 1;
             } else {
                 i += 1;
             }
         }
 
-        // Try not to do unnecessary allocations
-        if (!needs_modification) {
-            return .{ .value = input };
-        }
+        // TODO: Figure out how to only deallocate when it is allocated.
+        // // Try not to do unnecessary allocations
+        // if (!needs_modification) {
+        //     return input;
+        // }
 
         var raw_bytes = std.ArrayList(u8).init(allocator);
         errdefer raw_bytes.deinit();
@@ -120,7 +168,6 @@ pub const Url = struct {
                 i += 1;
             }
         }
-        std.debug.print("Got past unicode {s}\n", .{input});
 
         // Make sure its all valid UTF-8
         _ = std.unicode.Utf8View.init(raw_bytes.items) catch {
@@ -128,10 +175,7 @@ pub const Url = struct {
         };
 
         const owned_slice = try raw_bytes.toOwnedSlice();
-        return .{
-            .value = owned_slice,
-            .allocator = allocator,
-        };
+        return owned_slice;
     }
 };
 
@@ -154,53 +198,90 @@ const testing = std.testing;
 test "url: parse" {
     {
         // root
-        const url = try Url.parse("/");
+        var url = try Url.parse(testing.allocator, "/");
+        defer url.deinit();
         try testing.expectEqualStrings("/", url.raw);
         try testing.expectEqualStrings("/", url.path);
         try testing.expectEqualStrings("", url.query);
+        try testing.expectEqual(true, url.query_params.count() == 0);
+        try testing.expectEqual(true, url.path_segments.len == 0);
     }
     {
         // random /'s
-        const url = try Url.parse("/abc/de/f");
+        var url = try Url.parse(testing.allocator, "/abc/de/f");
+        defer url.deinit();
         try testing.expectEqualStrings("/abc/de/f", url.raw);
         try testing.expectEqualStrings("/abc/de/f", url.path);
         try testing.expectEqualStrings("", url.query);
+        try testing.expectEqual(true, url.query_params.count() == 0);
+        try testing.expectEqual(true, url.path_segments.len == 3);
     }
     {
         // root with query
-        const url = try Url.parse("/?urmom=fat");
+        var url = try Url.parse(testing.allocator, "/?urmom=fat");
+        defer url.deinit();
         try testing.expectEqualStrings("/?urmom=fat", url.raw);
         try testing.expectEqualStrings("/", url.path);
         try testing.expectEqualStrings("urmom=fat", url.query);
+        try testing.expectEqual(true, std.mem.eql(u8, url.query_params.get("urmom").?, "fat"));
+        try testing.expectEqual(true, url.path_segments.len == 0);
     }
     {
         // path and query
-        const url = try Url.parse("/abc?urmom=fat");
+        var url = try Url.parse(testing.allocator, "/abc?urmom=fat");
+        defer url.deinit();
         try testing.expectEqualStrings("/abc?urmom=fat", url.raw);
         try testing.expectEqualStrings("/abc", url.path);
         try testing.expectEqualStrings("urmom=fat", url.query);
+        try testing.expectEqual(true, std.mem.eql(u8, url.query_params.get("urmom").?, "fat"));
+        try testing.expectEqual(true, url.path_segments.len == 1);
     }
     {
         // root and empty query
-        const url = try Url.parse("/?");
+        var url = try Url.parse(testing.allocator, "/?");
+        defer url.deinit();
         try testing.expectEqualStrings("/?", url.raw);
         try testing.expectEqualStrings("/", url.path);
         try testing.expectEqualStrings("", url.query);
+        try testing.expectEqual(true, url.query_params.count() == 0);
+        try testing.expectEqual(true, url.path_segments.len == 0);
     }
     {
         // path and empty query
-        const url = try Url.parse("/abc?");
+        var url = try Url.parse(testing.allocator, "/abc?");
+        defer url.deinit();
         try testing.expectEqualStrings("/abc?", url.raw);
         try testing.expectEqualStrings("/abc", url.path);
         try testing.expectEqualStrings("", url.query);
+        try testing.expectEqual(true, url.query_params.count() == 0);
+        try testing.expectEqual(true, url.path_segments.len == 1);
+    }
+    {
+        // escaped full url
+        var url = try Url.parse(testing.allocator, "/blue+light%20blue?blue%2Blight+blue=you");
+        defer url.deinit();
+        try testing.expectEqualStrings("/blue+light%20blue?blue%2Blight+blue=you", url.raw);
+        try testing.expectEqualStrings("/blue+light blue", url.path);
+        try testing.expectEqualStrings("blue+light blue=you", url.query);
+        try testing.expectEqual(true, std.mem.eql(u8, url.query_params.get("blue+light blue").?, "you"));
+        try testing.expectEqual(true, url.path_segments.len == 1);
+    }
+    {
+        // escaped full url with only param query param
+        var url = try Url.parse(testing.allocator, "/blue+light%20blue?blue%2Blight+blue");
+        defer url.deinit();
+        try testing.expectEqualStrings("/blue+light%20blue?blue%2Blight+blue", url.raw);
+        try testing.expectEqualStrings("/blue+light blue", url.path);
+        try testing.expectEqualStrings("blue+light blue", url.query);
+        try testing.expectEqual(true, std.mem.eql(u8, url.query_params.get("blue+light blue").?, ""));
+        try testing.expectEqual(true, url.path_segments.len == 1);
     }
 }
 
 test "url: unescape" {
     {
         // Invalid URL
-        const input = "%";
-        try testing.expectError(error.InvalidEscapeSequence, Url.unescape(testing.allocator, input, .Path));
+        try testing.expectError(error.InvalidEscapeSequence, Url.unescape(testing.allocator, "%", .Path));
     }
     {
         // Invalid escape sequence at end
@@ -220,38 +301,39 @@ test "url: unescape" {
     {
         // No modification needed
         const input = "hello world";
-        var result = try Url.unescape(testing.allocator, input, .Path);
-        defer result.deinit();
+        var allocator = testing.allocator;
+        const result = try Url.unescape(allocator, input, .Path);
 
-        try testing.expectEqualStrings(input, result.value);
-        try testing.expect(result.allocator == null);
+        try testing.expectEqualStrings(input, result);
+
+        allocator.free(result);
     }
     {
         // Unicode escapes
         const escaped_str = "Hello+G%C3%BCnter";
         const unescaped_str = "Hello Günter";
-        var res = try Url.unescape(testing.allocator, escaped_str, .Query);
-        defer res.deinit();
+        var allocator = testing.allocator;
+        const res = try Url.unescape(allocator, escaped_str, .Query);
 
-        try testing.expectEqualStrings(unescaped_str, res.value);
-        try testing.expect(res.allocator != null);
+        try testing.expectEqualStrings(unescaped_str, res);
+        allocator.free(res);
     }
     {
         // Unicode escapes and + symbol in path
         const escaped_str = "Hello+G%C3%BCnter";
         const unescaped_str = "Hello+Günter";
-        var res = try Url.unescape(testing.allocator, escaped_str, .Path);
-        defer res.deinit();
+        var allocator = testing.allocator;
+        const res = try Url.unescape(allocator, escaped_str, .Path);
 
-        try testing.expectEqualStrings(unescaped_str, res.value);
-        try testing.expect(res.allocator != null);
+        try testing.expectEqualStrings(unescaped_str, res);
+        allocator.free(res);
     }
     {
         const input = "%F0%9F%98%80 smile";
-        var result = try Url.unescape(testing.allocator, input, .Path);
-        defer result.deinit();
+        var allocator = testing.allocator;
+        const result = try Url.unescape(allocator, input, .Path);
 
-        try testing.expectEqualStrings("😀 smile", result.value);
-        try testing.expect(result.allocator != null);
+        try testing.expectEqualStrings("😀 smile", result);
+        allocator.free(result);
     }
 }
