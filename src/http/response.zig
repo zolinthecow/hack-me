@@ -11,6 +11,7 @@ const Method = server_pkg.Method;
 const MethodMap = server_pkg.MethodMap;
 const Protocol = server_pkg.Protocol;
 const ProtocolMap = server_pkg.ProtocolMap;
+const ContentTypeToHeaderStr = server_pkg.ContentTypeToHeaderStr;
 
 // Subset of https://developer.mozilla.org/en-US/docs/Web/HTTP/Status#client_error_responses
 pub const StatusCode = std.StaticStringMap([]const u8).initComptime(.{
@@ -61,7 +62,7 @@ pub const Response = struct {
         const response_body = try build_response(response);
         try std.posix.write(self.sock, response_body);
 
-        if (self.request.protocol == .HTTP10 or std.mem.eql(self.request.headers.get("Connection").?, "close")) {
+        if (self.request.*.protocol == .HTTP10 or std.mem.eql(u8, self.request.*.headers.get("Connection") orelse "", "close")) {
             std.posix.close(self.sock);
         }
     }
@@ -73,14 +74,33 @@ pub const Response = struct {
         const status_code = StatusCode.get(response_parts.status_code) orelse return error.InvalidStatusCode;
         try response_list.writer().print("{s}\r\n", .{status_code});
 
-        const date = try getHttpDate();
-        try response_list.writer().print("Date: {s}\r\nServer: Zerver\r\n", .{date});
+        var headers_to_write = std.StringHashMap([]const u8).init(self.arena);
 
+        const date = try getHttpDate();
+        try headers_to_write.put("Date", &date);
+        try headers_to_write.put("Server", "Zerver 0.0.1");
+        // Default content type will be text/plain, overridden by passed in headers
+        try headers_to_write.put("Content-Type", ContentTypeToHeaderStr(.TEXTPLAIN));
+        const body_len_str = try std.fmt.allocPrint(self.arena, "{}", .{response_parts.body.len});
+        try headers_to_write.put("Content-Length", body_len_str);
+        // Connection should be closed if HTTP/1.0 or explicitly set in request headers
+        if (self.request.*.protocol == .HTTP10 or std.mem.eql(u8, self.request.*.headers.get("Connection") orelse "", "close")) {
+            try headers_to_write.put("Connection", "close");
+        } else {
+            try headers_to_write.put("Connection", "keep-alive");
+        }
+
+        // Passed in headers should override default
         if (response_parts.headers) |headers| {
             var headers_it = headers.iterator();
             while (headers_it.next()) |header| {
-                try response_list.writer().print("{s}: {s}\r\n", .{ header.key_ptr.*, header.value_ptr.* });
+                try headers_to_write.put(header.key_ptr.*, header.value_ptr.*);
             }
+        }
+
+        var headers_to_write_it = headers_to_write.iterator();
+        while (headers_to_write_it.next()) |header| {
+            try response_list.writer().print("{s}: {s}\r\n", .{ header.key_ptr.*, header.value_ptr.* });
         }
 
         try response_list.appendSlice("\r\n");

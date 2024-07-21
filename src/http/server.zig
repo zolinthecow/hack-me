@@ -5,6 +5,53 @@ const posix = std.posix;
 const EventLoop = @import("event_loop.zig").EventLoop;
 const Request = @import("request.zig").Request;
 
+pub const Protocol = enum {
+    HTTP10,
+    HTTP11,
+    HTTP2, // Support later
+};
+pub const ProtocolMap = std.StaticStringMap(Protocol).initComptime(.{
+    .{ "HTTP/1.0", .HTTP10 },
+    .{ "HTTP/1.1", .HTTP11 },
+    .{ "HTTP/2", .HTTP2 },
+});
+
+pub const Method = enum {
+    GET,
+    PUT,
+    POST,
+    PATCH,
+    DELETE,
+};
+pub const MethodMap = std.StaticStringMap(Method).initComptime(.{
+    .{ "GET", .GET },
+    .{ "PUT", .PUT },
+    .{ "POST", .POST },
+    .{ "PATCH", .PATCH },
+    .{ "DELETE", .DELETE },
+});
+
+pub const ContentType = enum {
+    IMAGEPNG,
+    APPLICATIONJSON,
+    TEXTHTML,
+    TEXTPLAIN,
+};
+pub const ContentTypeStrToEnumMap = std.StaticStringMap(ContentType).initComptime(.{
+    .{ "image/png", .IMAGEPNG },
+    .{ "application/json", .APPLICATIONJSON },
+    .{ "text/html", .TEXTHTML },
+    .{ "text/plain", .TEXTPLAIN },
+});
+pub fn ContentTypeToHeaderStr(content_type: ContentType) []const u8 {
+    return switch (content_type) {
+        .APPLICATIONJSON => "application/json; charset=utf-8",
+        .IMAGEPNG => "image/png",
+        .TEXTHTML => "text/html; charset=utf-8",
+        .TEXTPLAIN => "text/plain; charset=utf-8",
+    };
+}
+
 pub const Config = struct {
     port: ?u16 = null,
     address: ?[]const u8 = null,
